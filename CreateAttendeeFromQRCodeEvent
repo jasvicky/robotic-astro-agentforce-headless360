@@ -1,0 +1,216 @@
+/**
+ * Creates OR updates an Attendee__c record from each QRCodeEvent__e
+ * DUPLICATE-PROOF VERSION: Strictly matches on UIN first.
+ */
+trigger CreateAttendeeFromQRCodeEvent on QRCodeEvent__e (after insert) {
+
+    /* ----------------------------------------------------
+       1.  Gather all unique keys from the incoming events
+    ---------------------------------------------------- */
+    Set<String> emailKeys   = new Set<String>();
+    Set<String> regKeys     = new Set<String>();   
+    Set<String> uinKeys     = new Set<String>();   // NEW: Track UINs
+    Set<String> regUinKeys  = new Set<String>();   
+    Set<String> eventKeys   = new Set<String>();   
+
+    for (QRCodeEvent__e ev : Trigger.new) {
+        if (String.isNotBlank(ev.Email__c)) {
+            emailKeys.add(ev.Email__c.trim().toLowerCase());
+        }
+
+        String reg = String.isNotBlank(ev.Event_Registration_Number__c) ? ev.Event_Registration_Number__c.trim() : null;
+        String uin = String.isNotBlank(ev.Unique_Identity_Number__c) ? ev.Unique_Identity_Number__c.trim() : null;
+
+        if (reg != null) {
+            regKeys.add(reg);
+            eventKeys.add(reg); 
+        }
+        if (uin != null) {
+            uinKeys.add(uin); // Populate UIN set
+        }
+        if (reg != null && uin != null) {
+            regUinKeys.add(reg + '|' + uin);
+        }
+    }
+
+    /* ----------------------------------------------------
+       2.  Fetch existing Attendees & Build Maps
+    ---------------------------------------------------- */
+    Map<String, Attendee__c> email2Att  = new Map<String, Attendee__c>();
+    Map<String, Attendee__c> reg2Att    = new Map<String, Attendee__c>();
+    Map<String, Attendee__c> uin2Att    = new Map<String, Attendee__c>(); // NEW: UIN Map
+    Map<String, Attendee__c> regUin2Att = new Map<String, Attendee__c>();
+
+    // UPDATED SOQL: Now searches by UIN as well!
+    if (!emailKeys.isEmpty() || !regKeys.isEmpty() || !uinKeys.isEmpty()) {
+        for (Attendee__c a : [
+            SELECT Id, Email__c, Event_Registration_Number__c, Unique_Identity_Number__c,
+                   First_Name__c, Last_Name__c, Mobile_Number__c, Status__c,
+                   Has_Attended__c, Attended_Date_Time__c, Ground_Help_Crew_Required__c
+            FROM   Attendee__c
+            WHERE  Email__c IN :emailKeys
+               OR  Event_Registration_Number__c IN :regKeys
+               OR  Unique_Identity_Number__c IN :uinKeys // Strictly prevents duplicates
+        ]) {
+            if (String.isNotBlank(a.Email__c)) {
+                email2Att.put(a.Email__c.trim().toLowerCase(), a);
+            }
+            if (String.isNotBlank(a.Unique_Identity_Number__c)) {
+                uin2Att.put(a.Unique_Identity_Number__c.trim(), a);
+            }
+            if (String.isNotBlank(a.Event_Registration_Number__c)) {
+                String r = a.Event_Registration_Number__c.trim();
+                reg2Att.put(r, a);
+
+                if (String.isNotBlank(a.Unique_Identity_Number__c)) {
+                    String key = r + '|' + a.Unique_Identity_Number__c.trim();
+                    regUin2Att.put(key, a);
+                }
+            }
+        }
+    }
+
+    /* ----------------------------------------------------
+       3.  Fetch the Event__c records 
+    ---------------------------------------------------- */
+    Map<String, Event__c> reg2Event = new Map<String, Event__c>();
+    if (!eventKeys.isEmpty()) {
+        for (Event__c ev : [SELECT Id, Event_Registration_Number__c FROM Event__c WHERE Event_Registration_Number__c IN :eventKeys]) {
+            if (String.isNotBlank(ev.Event_Registration_Number__c)) {
+                reg2Event.put(ev.Event_Registration_Number__c.trim(), ev);
+            }
+        }
+    }
+
+    /* ----------------------------------------------------
+       4.  Prepare lists for DML
+    ---------------------------------------------------- */
+    List<Attendee__c> toInsertA = new List<Attendee__c>();
+    List<Attendee__c> toUpdateA = new List<Attendee__c>();
+
+    /* ----------------------------------------------------
+       5.  Main loop: Upsert Logic
+    ---------------------------------------------------- */
+    for (QRCodeEvent__e ev : Trigger.new) {
+        String emailKey = String.isNotBlank(ev.Email__c) ? ev.Email__c.trim().toLowerCase() : null;
+        String regKey   = String.isNotBlank(ev.Event_Registration_Number__c) ? ev.Event_Registration_Number__c.trim() : null;
+        String uinKey   = String.isNotBlank(ev.Unique_Identity_Number__c) ? ev.Unique_Identity_Number__c.trim() : null;
+        String regUinKey = (regKey != null && uinKey != null) ? regKey + '|' + uinKey : null;
+
+        Attendee__c att = null;
+        Boolean matchedByRegUin = false;
+
+        // MATCHING HIERARCHY: Finds the existing record
+        if (regUinKey != null && regUin2Att.containsKey(regUinKey)) {
+            att = regUin2Att.get(regUinKey);
+            matchedByRegUin = true;
+        } else if (uinKey != null && uin2Att.containsKey(uinKey)) {
+            att = uin2Att.get(uinKey); // Catch it by UIN!
+        } else if (emailKey != null && email2Att.containsKey(emailKey)) {
+            att = email2Att.get(emailKey);
+        } else if (regKey != null && reg2Att.containsKey(regKey)) {
+            att = reg2Att.get(regKey);
+        }
+
+        if (att == null) {
+            /* ---- NEW attendee ---- */
+            att = new Attendee__c(
+                First_Name__c                = ev.First_Name__c,
+                Last_Name__c                 = ev.Last_Name__c,
+                Mobile_Number__c             = String.valueOf(ev.Mobile_Number__c),
+                Email__c                     = ev.Email__c,
+                Has_Attended__c              = true,
+                Event_Registration_Number__c = ev.Event_Registration_Number__c,
+                Unique_Identity_Number__c    = ev.Unique_Identity_Number__c,
+                Status__c                    = ev.Status__c,
+                Attended_Date_Time__c        = System.now(),
+                Ground_Help_Crew_Required__c = ev.Ground_Help_Crew_Required__c 
+            );
+            toInsertA.add(att);
+
+            if (emailKey != null) email2Att.put(emailKey, att);
+            if (uinKey != null) uin2Att.put(uinKey, att);
+            if (regKey != null) reg2Att.put(regKey, att);
+            if (regUinKey != null) regUin2Att.put(regUinKey, att);
+
+        } else {
+            /* ---- EXISTING attendee (UPDATE ONLY) ---- */
+            if (matchedByRegUin) {
+                att.Has_Attended__c       = true;
+                att.Attended_Date_Time__c = System.now();
+                if (ev.Ground_Help_Crew_Required__c == true) {
+                    att.Ground_Help_Crew_Required__c = true;
+                }
+            } else {
+                att.First_Name__c         = ev.First_Name__c;
+                att.Last_Name__c          = ev.Last_Name__c;
+                att.Mobile_Number__c      = String.valueOf(ev.Mobile_Number__c);
+                att.Has_Attended__c       = true;
+                att.Status__c             = ev.Status__c;
+                att.Attended_Date_Time__c = System.now();
+                if (ev.Ground_Help_Crew_Required__c == true) {
+                    att.Ground_Help_Crew_Required__c = true;
+                }
+
+                if (att.Email__c == null && emailKey != null) att.Email__c = ev.Email__c;
+                if (att.Event_Registration_Number__c == null && regKey != null) att.Event_Registration_Number__c = regKey;
+                if (att.Unique_Identity_Number__c == null && uinKey != null) att.Unique_Identity_Number__c = uinKey;
+            }
+            toUpdateA.add(att);
+        }
+    }
+
+    /* ----------------------------------------------------
+       6.  DML operations for Attendee__c
+    ---------------------------------------------------- */
+    if (!toInsertA.isEmpty()) insert toInsertA;
+    if (!toUpdateA.isEmpty()) update toUpdateA;
+
+    /* ----------------------------------------------------
+       7. Safely Create and Insert Junction Records
+    ---------------------------------------------------- */
+    List<Event_And_Attendee__c> toInsertEA = new List<Event_And_Attendee__c>();
+    Set<String> uniqueAE = new Set<String>();
+
+    for (QRCodeEvent__e ev : Trigger.new) {
+        String regKey = String.isNotBlank(ev.Event_Registration_Number__c) ? ev.Event_Registration_Number__c.trim() : null;
+        
+        if (regKey != null && reg2Event.containsKey(regKey)) {
+            Event__c evRec = reg2Event.get(regKey);
+            
+            Attendee__c att = null;
+            String uinKey = String.isNotBlank(ev.Unique_Identity_Number__c) ? ev.Unique_Identity_Number__c.trim() : null;
+            String regUinKey = (regKey != null && uinKey != null) ? regKey + '|' + uinKey : null;
+            String emailKey = String.isNotBlank(ev.Email__c) ? ev.Email__c.trim().toLowerCase() : null;
+
+            if (regUinKey != null && regUin2Att.containsKey(regUinKey)) att = regUin2Att.get(regUinKey);
+            else if (uinKey != null && uin2Att.containsKey(uinKey)) att = uin2Att.get(uinKey);
+            else if (emailKey != null && email2Att.containsKey(emailKey)) att = email2Att.get(emailKey);
+            else if (regKey != null && reg2Att.containsKey(regKey)) att = reg2Att.get(regKey);
+
+            if (att != null && att.Id != null) {
+                String composite = att.Id + '|' + evRec.Id;
+                if (!uniqueAE.contains(composite)) {
+                    toInsertEA.add(new Event_And_Attendee__c(
+                        Attendee__c = att.Id, 
+                        Event__c = evRec.Id
+                    ));
+                    uniqueAE.add(composite);
+                }
+            }
+        }
+    }
+
+    if (!toInsertEA.isEmpty()) insert toInsertEA;
+
+    /* ----------------------------------------------------
+       8.  Enqueue GreetingJob asynchronously 
+    ---------------------------------------------------- */
+    Set<Id> finalIds = new Set<Id>();
+    for (Attendee__c a : toInsertA) finalIds.add(a.Id);
+    for (Attendee__c a : toUpdateA) finalIds.add(a.Id);
+
+    if (!finalIds.isEmpty()) {
+        System.enqueueJob(new GreetingJob(new List<Id>(finalIds)));
+    }
+}
