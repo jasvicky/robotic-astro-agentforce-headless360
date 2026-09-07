@@ -1,0 +1,112 @@
+@RestResource(urlMapping='/eventSessions')
+global with sharing class EventSessionsRest {
+
+    // Incoming JSON from ESP32
+    global class RequestWrapper {
+        public Id attendeeId;   // required
+        public String consent;  // "YES" or "NO"
+        public String robotId;  // optional: e.g. "Robot01"
+    }
+
+    // Outgoing JSON back to ESP32 (optional, but useful)
+    global class ResponseWrapper {
+        public Boolean success;
+        public String message;
+    }
+
+    @HttpPost
+    global static ResponseWrapper handlePost() {
+        RestRequest req = RestContext.request;
+        String body = req.requestBody.toString();
+        RequestWrapper input;
+
+        // 1) Parse incoming JSON
+        try {
+            input = (RequestWrapper) JSON.deserialize(body, RequestWrapper.class);
+        } catch (Exception e) {
+            ResponseWrapper err = new ResponseWrapper();
+            err.success = false;
+            err.message = 'Invalid JSON: ' + e.getMessage();
+            return err;
+        }
+
+        ResponseWrapper resp = new ResponseWrapper();
+
+        if (input == null || input.attendeeId == null) {
+            resp.success = false;
+            resp.message = 'attendeeId is required.';
+            return resp;
+        }
+
+        // Default robotId if not provided
+        if (String.isBlank(input.robotId)) {
+            input.robotId = 'Robot01';
+        }
+
+        String finalMessage;
+
+        // 2) Handle consent YES/NO
+        if (input.consent != null && input.consent.toUpperCase() == 'YES') {
+            try {
+                // Build request for ConfirmRequestedSessionsAction
+                List<ConfirmRequestedSessionsAction.Request> reqs =
+                    new List<ConfirmRequestedSessionsAction.Request>();
+
+                ConfirmRequestedSessionsAction.Request r =
+                    new ConfirmRequestedSessionsAction.Request();
+                r.attendeeId = input.attendeeId;
+                r.robotId    = input.robotId;
+                reqs.add(r);
+
+                // CALL THE REAL INVOCABLE METHOD NAME: execute
+                List<ConfirmRequestedSessionsAction.Response> resList =
+                    ConfirmRequestedSessionsAction.execute(reqs);
+
+                if (!resList.isEmpty()) {
+                    ConfirmRequestedSessionsAction.Response r0 = resList[0];
+                    if (r0.confirmationMessage != null) {
+                        finalMessage = r0.confirmationMessage;
+                    } else {
+                        finalMessage = 'Your requested sessions have been processed.';
+                    }
+                } else {
+                    finalMessage = 'No confirmation details returned, but sessions were processed.';
+                }
+            } catch (Exception e) {
+                finalMessage = 'Sorry, there was an error confirming your sessions: ' + e.getMessage();
+            }
+        } else {
+            // NO or anything other than YES
+            finalMessage = 'You chose not to confirm your requested sessions.';
+        }
+
+        // 3) Send finalMessage to ThingSpeak using your existing invocable
+        try {
+            SendSessionsMsgToAstro.Request tsReq = new SendSessionsMsgToAstro.Request();
+            tsReq.attendeeId      = input.attendeeId;
+            tsReq.sessionsSummary = finalMessage;
+            tsReq.robotId         = input.robotId;
+
+            List<SendSessionsMsgToAstro.Request> tsReqs =
+                new List<SendSessionsMsgToAstro.Request>{ tsReq };
+
+            List<SendSessionsMsgToAstro.Response> tsRes =
+                SendSessionsMsgToAstro.sendToRobot(tsReqs);
+
+            if (!tsRes.isEmpty() && tsRes[0].success) {
+                resp.success = true;
+                resp.message = finalMessage;
+            } else {
+                resp.success = false;
+                resp.message = 'ThingSpeak error: ' +
+                    (tsRes.isEmpty() ? 'No response from SendSessionsMsgToAstro'
+                                     : tsRes[0].errorMessage);
+            }
+        } catch (Exception e) {
+            resp.success = false;
+            resp.message = 'Exception sending to ThingSpeak: ' + e.getMessage();
+        }
+
+        return resp;
+    }
+}
