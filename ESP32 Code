@@ -1,0 +1,2175 @@
+//ESP32 Dev Module Master TFT, Slack , Agentforce, SIM800, Salesforce Platform Event, Help Button
+//Test Data: {"firstName":"Jasjit","lastName":"Singh","mobile":"9971505511","crewHelp":true,"email":"jasvicky@gmail.com","regNum":"SF997150JS","status":"Confirmed","hasAttended":true,"uin":"SFJASJI9971505511"}
+
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// --------- Parsed QR Fields ---------
+struct QRFields {
+  String firstName;
+  String lastName;
+  String mobileNumber;
+  String email;
+  String registrationNumber;   // Event Registration Number
+  String uniqueId;             // UIN from QR: "UIN: SFJASJIT9971505511"
+  String status;
+  String helpcrew;
+  bool hasAttended;
+
+};
+
+// --------- TFT Setup ----------------
+TFT_eSPI tft = TFT_eSPI(); 
+
+// --------- Pin Definitions SIM800----
+
+#define SIM800_TX 17
+#define SIM800_RX 16
+HardwareSerial sim800(1);
+
+// -------------------------- UI State & Data (Defined ONLY ONCE now) ------
+
+enum Page { PAGE_MAIN, PAGE_SESSIONS, PAGE_FEEDBACK }; // Added PAGE_FEEDBACK
+Page currentPage = PAGE_MAIN;
+
+// --- Existing UI Strings (Keep or update these) ---
+String uiName = "Waiting for Scan..."; 
+String uiStatus = "-";
+String uiMobile = "-";
+bool uicrewHelp = false;
+
+// --- Global Variables for Salesforce Platform Event ---
+String uiFirstName = "";
+String uiLastName = "";
+String uiEmail = "";
+String uiEventRegNum = "";
+bool uiHasAttended = false;
+String uiUIN = "";
+
+String sessions[10];
+int sessionCount = 0;
+String lastScannedMobile = ""; 
+unsigned long lastInteractionTime = 0;           // Tracks the last time the screen was touched or updated
+bool seatConfirmedAnnounced = false;
+const bool SIM800_ENABLED = true;
+
+// ------------------------------ Timeout Logic Variables --------------------
+
+bool displayingData = false;                          // Tracks if we are showing scan results
+unsigned long dataDisplayStartTime = 0;               // Stores the time when scan started
+const unsigned long dataDisplayDuration = 45000;      // Time in milliseconds (30 seconds)
+unsigned long lastBlinkTime = 0;
+bool blinkState = true;
+
+// ------------------------------Calibration data for touch------------------
+uint16_t calData[5] = { 275, 3620, 264, 3532, 1 };
+
+// ------------------------- Config (WiFi, MQTT, Slack, Salesforce) ---------
+
+const char* ssid = "Airtel_9971505511";
+const char* password = "air57142";
+const char* mqtt_server = "broker.hivemq.com";
+const char* mqtt_topic = "event/attendee";
+
+
+//------------------------- Salesforce & Slack Credentials--------------------------
+
+const char* sfClientId      = " ";
+const char* sfClientSecret  = "";
+const char* sfUsername      = "akashdeep1k573@agentforce.com";
+const char* sfPasswordTok   = " "   
+String sfAccessToken = "";
+String sfInstanceUrl = "";
+#define SF_EVENT_URL        "/services/data/v59.0/sobjects/QRCodeEvent__e"
+
+const char* slackWebhookURL = "";
+
+
+//---------------------------ThingSpeak for Agentforce------------------------------
+
+const char* tsReadApiKey = "F7NWC5Y1B95OWQ8R";
+const int tsChannelId = 3213929;
+String tsAttendeeId = "";
+String tsSessions = "";      
+int tsLastEntryId = -1;      
+unsigned long lastTsCheck = 0;
+unsigned long lastMqttRetry = 0;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+String globalSessionData = "Loading sessions...";
+
+// ---------------------------- Color Palette -----------------------
+
+#define BLACK       0x0000    // Black is white
+#define DARK_BLUE   0x000F   // Deep Blue for Header
+#define BLUE        0x001F
+#define RED         0xF800   // Red is Yellow
+#define GREEN       0x07E0   // GREEN is Magenta
+#define CYAN        0x07FF   // Cyan is Dark Blue
+#define MAGENTA     0xF81F   // Magenta is GREEN
+#define YELLOW      0xFFE0   // Yellow is Red
+#define WHITE       0xFFFF   // White is Black
+#define SKY_BLUE    0x867D   // Light Blue for Buttons
+
+// ---------------------------- UI Theme Mapping -----------------------
+
+#define HEADER_BG   0x000F  // Deep/Dark Blue
+#define BODY_BG     0xF800  // Magenta (will look Green if inverted)
+#define BUTTON_BG   0x867D  // Sky Blue (Light Blue)
+
+// ----------------------- Layout Defines -------------------------
+
+#define BTN_W 130
+#define BTN_H 40
+#define BTN_Y 185
+#define BTN_LEFT_X 20
+#define BTN_RIGHT_X 170
+
+#define HEADER_H 40
+#define FOOTER_H 60
+#define CONTENT_Y HEADER_H
+#define CONTENT_H (SCREEN_H - HEADER_H - FOOTER_H)
+
+
+// ------------------------Screen size (Display)-------------------------
+
+#define SCREEN_W 320
+#define SCREEN_H 240
+
+// ----------------------- Forward Declarations ------------------------
+void sendSlackAlert(const String& name, const String& mobile, const String& status);
+void flashButton(int x, int y, int w, int h, uint16_t highlightColor, String label, uint16_t originalColor);
+void showFeedback(String msg, uint16_t color);
+void drawMainPage();
+void drawSessionsPage();
+void drawSessionsList();
+void executeKioskFlow();
+void simulateHelpRequest();
+void drawIdleBlink();
+void handleTouch();
+void pollThingSpeak();
+void reconnectMQTT();
+void connectWiFi();
+bool sfLogin();
+bool sendConsentToSalesforce(bool yes);
+void sendPlatformEvent(const QRFields& fields);
+void showCrewResponse(String attendee, String crew);
+String buildPersonalizedSMS(const String& firstName, const String& status);
+String buildCrewArrivalSMS(const String& firstName, const String& crewName, const String& crewPhone);
+void sendSMS(const String& number, const String& text);
+void resetScreenTimeout();
+void resetToStandby();
+
+// ----------------------- UI DRAWING ----------------------------------
+
+void drawBackground() {
+    tft.fillScreen(BODY_BG);
+}
+
+void drawHeader() {
+    tft.fillRect(0, 0, 320, 40, HEADER_BG);
+    tft.setTextColor(CYAN);
+    tft.setTextSize(2);
+    tft.setCursor(10, 12);
+    tft.println("Agentic Astro's Response:");
+}
+
+void drawMainContent() {
+    // 1. Clear the magenta area
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, TFT_MAGENTA);
+    
+    // --- Text Fields ---
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(2);
+    
+    int paddingX = 15;
+
+    // Line 1: Name
+    tft.setCursor(paddingX, 60);  
+    tft.print("Name    : "); tft.println(uiName);
+    
+    // Line 2: Status
+    tft.setCursor(paddingX, 90);  
+    tft.print("Status  : "); tft.println(uiStatus);
+    
+    // Line 3: Mobile
+    tft.setCursor(paddingX, 120); 
+    tft.print("Mobile  : "); tft.println(uiMobile);
+    
+    // Line 4: CrewHelp
+    tft.setCursor(paddingX, 150); 
+    tft.print("CrewHelp: "); 
+    
+    if (uicrewHelp) {
+        tft.setTextColor(CYAN);
+        tft.println("true");
+    } else {
+        tft.setTextColor(YELLOW);
+        tft.println("false");
+    }
+    
+    tft.setTextColor(TFT_WHITE);
+}
+
+void drawMainButtons() {
+    // --- Button 1: SESSIONS (Left) ---
+    tft.fillRect(BTN_LEFT_X, BTN_Y, BTN_W, BTN_H, BLUE);
+    tft.setTextColor(CYAN);
+    tft.setTextSize(2);
+    tft.setCursor(BTN_LEFT_X + 15, BTN_Y + 12); 
+    tft.print("Sessions");
+
+    // --- Button 2: HELP YES (Right - Replaces Selfie) ---
+    tft.fillRect(BTN_RIGHT_X, BTN_Y, BTN_W, BTN_H, BLUE);
+    tft.setTextColor(CYAN);
+    tft.setTextSize(2);
+    tft.setCursor(BTN_RIGHT_X + 18, BTN_Y + 12);
+    tft.print("Help YES");
+}
+
+void drawMainPage() {
+    currentPage = PAGE_MAIN;
+    drawBackground();
+    drawHeader();
+    
+    if (displayingData) {
+        drawMainContent();
+        drawMainButtons();
+    } else {
+        tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H + FOOTER_H, TFT_MAGENTA);
+    }
+}
+
+// ------------------------- 45 SECOND SCREEN TIMEOUT -------------------------
+// Starts/restarts the 45-second timer for whichever interactive screen is active.
+// The standby screen (PAGE_MAIN with displayingData == false) has no timeout.
+void resetScreenTimeout() {
+    lastInteractionTime = millis();
+    dataDisplayStartTime = lastInteractionTime;
+}
+
+// Return the kiosk to the clean standby screen and clear attendee-specific data.
+void resetToStandby() {
+    displayingData = false;
+    currentPage = PAGE_MAIN;
+
+    uiFirstName = "";
+    uiLastName = "";
+    uiName = "Waiting for Scan...";
+    uiStatus = "-";
+    uiMobile = "-";
+    uiEmail = "";
+    uiEventRegNum = "";
+    uiUIN = "";
+    uicrewHelp = false;
+    uiHasAttended = false;
+
+    drawMainPage();
+    resetScreenTimeout();
+}
+
+void drawSessionButtons() {
+    tft.fillRect(BTN_LEFT_X, BTN_Y, BTN_W, BTN_H, GREEN);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(BTN_LEFT_X + 45, BTN_Y + 12); 
+    tft.print("YES");
+
+    tft.fillRect(BTN_RIGHT_X, BTN_Y, BTN_W, BTN_H, RED);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(BTN_RIGHT_X + 50, BTN_Y + 12);
+    tft.print("NO");
+}
+
+void drawOnlyBackButton() {
+    int btnY = 190;
+    int btnW = 120;
+    int btnH = 40;
+
+    tft.fillRoundRect(100, btnY, btnW, btnH, 8, RED);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.drawCentreString("BACK", 160, btnY + 12, 1);
+    
+    tft.setTextColor(YELLOW);
+    tft.setCursor(15, btnY - 25);
+    tft.println("Return to Main Screen:");
+}
+
+//-------------------------- Draw Sessions List------------------------------
+
+void drawSessionsList() {
+    if (tsSessions.indexOf("confirmed") != -1) {
+        return; 
+    }
+
+    tft.fillRect(0, 45, 320, 140, BLACK); 
+    
+    if (tsSessions.indexOf("no requested sessions") != -1) {
+        tft.setTextColor(WHITE);
+        tft.setTextSize(2);
+        tft.drawCentreString("No sessions found.", 160, 100, 1);
+        tft.fillRect(0, 180, 320, 60, BLACK);
+        
+        drawOnlyBackButton(); 
+        return; 
+    }
+    
+    String sessionData = tsSessions;
+    sessionData.replace("!", "");
+    sessionData.trim();
+
+    int y = 50;
+    int paddingLeft = 15;
+    int sessionNum = 1;
+    int lastPos = 0;
+
+    while (lastPos < sessionData.length()) {
+        int semiPos = sessionData.indexOf(';', lastPos);
+        String line = (semiPos != -1) ? sessionData.substring(lastPos, semiPos) : sessionData.substring(lastPos);
+        line.trim();
+
+        if (line.length() > 0) {
+            if (!line.startsWith("Time") && !line.startsWith("Location")) {
+                tft.setCursor(paddingLeft, y);
+                tft.setTextColor(CYAN);
+                tft.setTextSize(2);
+                tft.print(sessionNum); tft.print(") ");
+                tft.setTextColor(WHITE);
+                tft.println(line);
+                sessionNum++;
+            } else {
+                tft.setCursor(paddingLeft + 30, y);
+                tft.setTextColor(WHITE);
+                tft.setTextSize(1);
+                tft.println(line);
+                tft.setTextSize(2);
+            }
+            y = tft.getCursorY() + 4;
+        }
+
+        if (semiPos == -1) break;
+        lastPos = semiPos + 1;
+    }
+
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(2); 
+    tft.setCursor(paddingLeft, y + 5); 
+    tft.println("Please Give Your Consent:");
+}
+
+// --------------------------- Data Updates -------------------------
+
+void updateTFT(String name, String status, String mobile, bool crewHelp) {
+    uiName = name;
+    uiStatus = status;
+    uiMobile = mobile;
+    uicrewHelp = crewHelp;
+    drawMainPage();
+}
+
+void updateSessions(String csv) {
+    sessionCount = 0;
+    int last = 0;
+  
+    while (true) {
+      int idx = csv.indexOf(',', last);
+      if (idx == -1) {
+        sessions[sessionCount++] = csv.substring(last);
+        break;
+      }
+      sessions[sessionCount++] = csv.substring(last, idx);
+      last = idx + 1;
+      if (sessionCount >= 10) break;
+    }
+  
+    if (currentPage == PAGE_SESSIONS) {
+      drawSessionsList();
+    }
+}
+
+//-------------------  SEND SLACK MESSAGE FUNCTION  ---------------------
+
+void sendSlackAlert(const String& name, const String& mobile, const String& status) {
+    WiFiClientSecure ssl;
+    ssl.setInsecure();
+    
+    HTTPClient http;
+    Serial.println("Attempting to send Slack alert...");
+
+    String maskedMobile;
+    if (mobile.length() >= 10) {
+        maskedMobile = "xxxxxx" + mobile.substring(mobile.length() - 4);
+    } else {
+        maskedMobile = "xxxxxx";
+    }
+
+    if (!http.begin(ssl, slackWebhookURL)) {
+        Serial.println("Slack Connection Failed");
+        return;
+    }
+    
+    http.addHeader("Content-Type", "application/json");
+  
+    String text = "*Help-Desk Alert* :rotating_light:\n";
+    text += "Attendee: *" + name + "*\n";
+    text += "Mobile: " + maskedMobile + "\n";
+    text += "Crew Help Requested: Yes";
+
+    String body = "{\"text\":\"" + text + "\"}";
+  
+    int code = http.POST(body);
+    
+    if (code == 200 || code == 201) {
+        Serial.println("✅ Slack Message Sent (Masked for Privacy)");
+    } else {
+        Serial.printf("❌ Slack Error: %d\n", code);
+    }
+  
+    http.end();
+}
+
+// --------------------- Function to send SMS using SIM800L---------------------
+
+void sendSMS(const String& number, const String& text) {
+
+    Serial.println("--- SMS DEBUG START ---");
+
+
+    // ============================================================
+    // 0. CHECK WHETHER SIM800 IS ENABLED
+    // ============================================================
+
+    if (!SIM800_ENABLED) {
+
+        Serial.println(
+            "SIM800 is DISABLED."
+        );
+
+        Serial.println(
+            "SMS sending skipped."
+        );
+
+        Serial.println(
+            "Set SIM800_ENABLED = true when "
+            "SIM800 is powered and connected."
+        );
+
+        Serial.println("--- SMS DEBUG END ---");
+
+        return;
+    }
+
+
+    // ============================================================
+    // 1. CHECK SIM800 COMMUNICATION
+    // ============================================================
+
+    while (sim800.available()) {
+        sim800.read();
+    }
+
+    Serial.println("Checking SIM800...");
+
+    sim800.println("AT");
+
+    unsigned long start = millis();
+    String atResponse = "";
+
+    while (millis() - start < 2000) {
+
+        while (sim800.available()) {
+            char c = sim800.read();
+            atResponse += c;
+        }
+
+        if (atResponse.indexOf("OK") != -1) {
+            break;
+        }
+
+        delay(5);
+    }
+
+    if (atResponse.indexOf("OK") == -1) {
+
+        Serial.println(
+            "ERROR: SIM800 is not responding to AT."
+        );
+
+        Serial.println("--- SMS DEBUG END ---");
+        return;
+    }
+
+    Serial.println("SIM800 AT communication OK.");
+
+
+    // ============================================================
+    // 2. CHECK NETWORK REGISTRATION
+    //    Retry for a short period if registration is temporarily
+    //    unavailable.
+    // ============================================================
+
+    bool registered = false;
+
+    // Maximum registration wait:
+    // 8 seconds
+    unsigned long registrationStart = millis();
+
+    while (millis() - registrationStart < 8000) {
+
+        // Clear old response
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println(
+            "Checking network registration..."
+        );
+
+        sim800.println("AT+CREG?");
+
+        unsigned long cregStart = millis();
+        String cregResponse = "";
+
+        // Wait up to 1500 ms for THIS response
+        while (millis() - cregStart < 1500) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                cregResponse += c;
+            }
+
+            delay(5);
+        }
+
+        Serial.print("CREG Response: ");
+        Serial.println(cregResponse);
+
+
+        // --------------------------------------------------------
+        // Registered on home network
+        // +CREG: 0,1
+        // --------------------------------------------------------
+
+        if (cregResponse.indexOf("+CREG: 0,1") != -1 ||
+            cregResponse.indexOf("+CREG: 1,1") != -1) {
+
+            registered = true;
+
+            Serial.println(
+                "SIM800 network status: "
+                "REGISTERED on home network."
+            );
+
+            break;
+        }
+
+
+        // --------------------------------------------------------
+        // Registered while roaming
+        // +CREG: 0,5
+        // --------------------------------------------------------
+
+        if (cregResponse.indexOf("+CREG: 0,5") != -1 ||
+            cregResponse.indexOf("+CREG: 1,5") != -1) {
+
+            registered = true;
+
+            Serial.println(
+                "SIM800 network status: "
+                "REGISTERED while roaming."
+            );
+
+            break;
+        }
+
+
+        // --------------------------------------------------------
+        // Not registered / still searching
+        // +CREG: 0,0
+        // +CREG: 0,2
+        // --------------------------------------------------------
+
+        Serial.println(
+            "SIM800 not registered yet. "
+            "Retrying..."
+        );
+
+        delay(300);
+    }
+
+
+    // ------------------------------------------------------------
+    // Registration failed after retry period
+    // ------------------------------------------------------------
+
+    if (!registered) {
+
+        Serial.println(
+            "ERROR: SIM800 could not register "
+            "on the cellular network within 8 seconds."
+        );
+
+        Serial.println(
+            "SMS was NOT sent."
+        );
+
+        Serial.println("--- SMS DEBUG END ---");
+        return;
+    }
+
+
+    // ============================================================
+    // 3. SET SMS TEXT MODE
+    // ============================================================
+
+    while (sim800.available()) {
+        sim800.read();
+    }
+
+    Serial.println(
+        "Setting SMS text mode..."
+    );
+
+    sim800.println("AT+CMGF=1");
+
+    start = millis();
+
+    String cmgfResponse = "";
+    bool textModeOK = false;
+
+    while (millis() - start < 3000) {
+
+        while (sim800.available()) {
+
+            char c = sim800.read();
+
+            cmgfResponse += c;
+        }
+
+        if (cmgfResponse.indexOf("OK") != -1) {
+
+            textModeOK = true;
+            break;
+        }
+
+        if (cmgfResponse.indexOf("ERROR") != -1) {
+            break;
+        }
+
+        delay(5);
+    }
+
+    Serial.print(
+        "CMGF Response: "
+    );
+
+    Serial.println(cmgfResponse);
+
+
+    if (!textModeOK) {
+
+        Serial.println(
+            "ERROR: SIM800 could not enter "
+            "SMS text mode."
+        );
+
+        Serial.println("--- SMS DEBUG END ---");
+        return;
+    }
+
+    Serial.println(
+        "SMS text mode: READY."
+    );
+
+
+    // ============================================================
+    // 4. SEND AT+CMGS
+    // ============================================================
+
+    while (sim800.available()) {
+        sim800.read();
+    }
+
+    Serial.println(
+        "Sending SMS to: " + number
+    );
+
+    sim800.print("AT+CMGS=\"");
+    sim800.print(number);
+    sim800.println("\"");
+
+
+    // ============================================================
+    // 5. WAIT FOR '>' PROMPT
+    // ============================================================
+
+    start = millis();
+
+    String cmgsResponse = "";
+    bool ready = false;
+
+    while (millis() - start < 5000) {
+
+        while (sim800.available()) {
+
+            char c = sim800.read();
+
+            Serial.write(c);
+
+            cmgsResponse += c;
+
+            // SIM800 is ready for SMS body
+            if (c == '>') {
+
+                ready = true;
+                break;
+            }
+        }
+
+        if (ready) {
+            break;
+        }
+
+        if (cmgsResponse.indexOf("ERROR") != -1) {
+            break;
+        }
+
+        delay(5);
+    }
+
+
+    // ------------------------------------------------------------
+    // No '>' prompt
+    // ------------------------------------------------------------
+
+    if (!ready) {
+
+        Serial.println();
+
+        Serial.println(
+            "ERROR: SIM800 never gave '>' prompt."
+        );
+
+        Serial.println(
+            "Complete CMGS response:"
+        );
+
+        Serial.println(cmgsResponse);
+
+        Serial.println("--- SMS DEBUG END ---");
+        return;
+    }
+
+
+    // ============================================================
+    // 6. SEND SMS BODY
+    // ============================================================
+
+    Serial.println();
+    Serial.println(
+        "Prompt > received."
+    );
+
+    Serial.println(
+        "Sending SMS text..."
+    );
+
+    sim800.print(text);
+
+    delay(300);
+
+
+    // ============================================================
+    // 7. SEND CTRL+Z
+    // ============================================================
+
+    Serial.println(
+        "Sending Ctrl+Z..."
+    );
+
+    sim800.write(26);
+
+
+    // ============================================================
+    // 8. WAIT FOR SMS RESULT
+    // ============================================================
+
+    Serial.println(
+        "Waiting for SMS network response..."
+    );
+
+    start = millis();
+
+    String smsResponse = "";
+
+    while (millis() - start < 15000) {
+
+        while (sim800.available()) {
+
+            char c = sim800.read();
+
+            Serial.write(c);
+
+            smsResponse += c;
+        }
+
+        // SMS successfully submitted
+        if (smsResponse.indexOf("+CMGS:") != -1) {
+
+            Serial.println();
+            Serial.println(
+                "SMS SENT SUCCESSFULLY."
+            );
+
+            Serial.println(
+                "--- SMS DEBUG END ---"
+            );
+
+            return;
+        }
+
+        // SMS failed
+        if (smsResponse.indexOf("ERROR") != -1) {
+
+            Serial.println();
+            Serial.println(
+                "SIM800 returned SMS ERROR."
+            );
+
+            Serial.println(
+                "Complete SMS response:"
+            );
+
+            Serial.println(smsResponse);
+
+            Serial.println(
+                "--- SMS DEBUG END ---"
+            );
+
+            return;
+        }
+
+        delay(5);
+    }
+
+
+    // ------------------------------------------------------------
+    // SMS response timeout
+    // ------------------------------------------------------------
+
+    Serial.println();
+
+    Serial.println(
+        "ERROR: Timed out waiting for SMS result."
+    );
+
+    Serial.println(
+        "Complete SMS response:"
+    );
+
+    Serial.println(smsResponse);
+
+    Serial.println(
+        "--- SMS DEBUG END ---"
+    );
+}
+
+// -------------------- MQTT callback: parse Slack message and send SMS----------------------
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("DEBUG: New Message on Topic: "); Serial.println(topic);
+    
+    String msg = "";
+    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+    Serial.println(msg);
+
+    // --- Handle Slack ACK Response ---
+    if (msg.startsWith("ACK:")) {
+        String cleanMsg = msg.substring(4); 
+        cleanMsg.replace("*", "");
+        cleanMsg.replace("_", "");
+        cleanMsg.trim();
+
+        String crewPhone = "";
+        int phoneSplitIndex = cleanMsg.lastIndexOf(":"); 
+        if (phoneSplitIndex != -1) {
+            crewPhone = cleanMsg.substring(phoneSplitIndex + 1);
+            crewPhone.trim();
+            cleanMsg = cleanMsg.substring(0, phoneSplitIndex);
+            cleanMsg.trim();
+        }
+
+        String separator = " handled by ";
+        int splitIndex = cleanMsg.indexOf(separator);
+
+        String attendeeName = "";
+        String crewName = "";
+
+        if (splitIndex != -1) {
+            attendeeName = cleanMsg.substring(0, splitIndex);
+            crewName = cleanMsg.substring(splitIndex + separator.length());
+        } else {
+            attendeeName = uiName;
+            crewName = cleanMsg;
+        }
+
+        uicrewHelp = false; 
+        
+        showCrewResponse(attendeeName, crewName); 
+        
+        Serial.println("--- SMS TRIGGER CHECK ---");
+        
+        if (lastScannedMobile.length() > 0) {
+            Serial.print("Target Mobile Found: "); Serial.println(lastScannedMobile);
+            String crewSms = buildCrewArrivalSMS(attendeeName, crewName, crewPhone);
+            
+            while(sim800.available()) sim800.read(); 
+            sendSMS(lastScannedMobile, crewSms);
+            delay(3500);
+        } else {
+            Serial.println("Memory empty, sending to TEST NUMBER instead...");
+            String crewSms = buildCrewArrivalSMS(attendeeName, crewName, crewPhone);
+            
+            while(sim800.available()) sim800.read(); 
+            sendSMS("9971505511", crewSms);
+            delay(3500);
+        }
+        
+        Serial.println("Slack Response Processed. Attendee: " + attendeeName + ", Crew: " + crewName + ", Phone: " + crewPhone);
+        return;
+    }
+
+    // --- Handle Attendee Scan (JSON) ---
+    StaticJsonDocument<512> doc; 
+    DeserializationError error = deserializeJson(doc, msg);
+    if (error) {
+        Serial.println("JSON parse failed or message is not JSON");
+        return;
+    }
+
+    String firstName = doc["firstName"] | "";
+    String lastName = doc["lastName"] | "";
+    String status = doc["status"] | "";
+    String mobileNumber = doc["mobileNumber"] | "";
+    String email = doc["email"] | "";
+    String registrationNumber = doc["registrationNumber"] | "";
+    String uniqueId = doc["uniqueId"] | "";
+    bool crewHelp = doc["crewHelp"] | false;
+
+    firstName.trim();
+    status.trim();
+    mobileNumber.trim();
+
+    if (mobileNumber.length() == 0 || firstName.length() == 0) {
+        Serial.println("Missing mobile number or first name in MQTT message.");
+        return; 
+    }
+
+    lastScannedMobile = mobileNumber;
+    client.publish("Jasakash/robot01/motion/control", "TALK_START");
+    String maskedMobile = "xxxxxx" + (mobileNumber.length() >= 10 ? mobileNumber.substring(6) : "");
+
+    Serial.println("--- SALESFORCE RECORD CREATION ---");
+    QRFields fields;
+    fields.firstName = firstName;
+    fields.lastName = lastName;
+    fields.mobileNumber = mobileNumber;
+    fields.email = email;
+    fields.registrationNumber = registrationNumber;
+    fields.uniqueId = uniqueId;
+    fields.status = status;
+    fields.helpcrew = crewHelp ? "true" : "false";
+
+    sendPlatformEvent(fields);
+
+    Serial.println("--- UPDATING TFT SCREEN ---");
+    uiName = firstName;
+    uiStatus = status;
+    uiMobile = maskedMobile;
+    uicrewHelp = crewHelp;
+
+    displayingData = true;
+    resetScreenTimeout();
+    
+    updateTFT(firstName, status, maskedMobile, crewHelp);
+
+    Serial.println("--- WELCOME SMS PROCESS ---");
+    String welcomeMsg = buildPersonalizedSMS(firstName, status);
+
+    while(sim800.available()) sim800.read(); 
+    sendSMS(mobileNumber, welcomeMsg);
+    
+    delay(3500); 
+
+    // NOTE: Slack alert removed from automated scan logic per request.
+}
+
+// ----------------------------- SETUP ---------------------------------------
+
+void setup() {
+
+    Serial.begin(115200);
+    Serial.setTimeout(50);
+
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("       ASTRO KIOSK STARTING");
+    Serial.println("======================================");
+
+
+    // ============================================================
+    // SIM800L INITIALIZATION
+    // ============================================================
+
+    if (SIM800_ENABLED) {
+
+        Serial.println();
+        Serial.println("======================================");
+        Serial.println("       SIM800 INITIALIZATION");
+        Serial.println("======================================");
+
+        sim800.begin(
+            9600,
+            SERIAL_8N1,
+            SIM800_RX,
+            SIM800_TX
+        );
+
+        delay(1500);
+
+        Serial.println();
+        Serial.println("--- SIM800L DEBUG START ---");
+
+
+        // --------------------------------------------------------
+        // 1. Basic SIM800 communication test
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println("Checking SIM800 communication...");
+
+        sim800.println("AT");
+
+        unsigned long start = millis();
+        String response = "";
+
+        while (millis() - start < 3000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                response += c;
+            }
+
+            if (response.indexOf("OK") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete AT Response:");
+        Serial.println(response);
+
+
+        if (response.indexOf("OK") != -1) {
+
+            Serial.println(
+                "SIM800 AT communication: OK"
+            );
+
+        } else {
+
+            Serial.println(
+                "CRITICAL: SIM800 not responding! "
+                "Check wiring, power supply, RX/TX and baud rate."
+            );
+        }
+
+
+        // --------------------------------------------------------
+        // 2. Check SIM card status
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println();
+        Serial.println("Checking SIM card status...");
+
+        sim800.println("AT+CPIN?");
+
+        start = millis();
+
+        String cpinResponse = "";
+
+        while (millis() - start < 3000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                cpinResponse += c;
+            }
+
+            if (cpinResponse.indexOf("OK") != -1 ||
+                cpinResponse.indexOf("ERROR") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete CPIN Response:");
+        Serial.println(cpinResponse);
+
+
+        if (cpinResponse.indexOf("+CPIN: READY") != -1) {
+
+            Serial.println(
+                "SIM card status: READY"
+            );
+
+        } else {
+
+            Serial.println(
+                "WARNING: SIM card is not reporting READY status."
+            );
+        }
+
+
+        // --------------------------------------------------------
+        // 3. Check network registration
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println();
+        Serial.println("Checking network registration...");
+
+        sim800.println("AT+CREG?");
+
+        start = millis();
+
+        String cregResponse = "";
+
+        while (millis() - start < 5000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                cregResponse += c;
+            }
+
+            if (cregResponse.indexOf("+CREG:") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete CREG Response:");
+        Serial.println(cregResponse);
+
+
+        if (cregResponse.indexOf(",1") != -1) {
+
+            Serial.println(
+                "SIM800 network status: "
+                "REGISTERED on home network."
+            );
+
+        } else if (cregResponse.indexOf(",5") != -1) {
+
+            Serial.println(
+                "SIM800 network status: "
+                "REGISTERED while roaming."
+            );
+
+        } else {
+
+            Serial.println(
+                "WARNING: SIM800 is NOT registered "
+                "on the cellular network."
+            );
+        }
+
+
+        // --------------------------------------------------------
+        // 4. Check signal strength
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println();
+        Serial.println("Checking signal strength...");
+
+        sim800.println("AT+CSQ");
+
+        start = millis();
+
+        String csqResponse = "";
+
+        while (millis() - start < 3000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                csqResponse += c;
+            }
+
+            if (csqResponse.indexOf("+CSQ:") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete CSQ Response:");
+        Serial.println(csqResponse);
+
+
+        // --------------------------------------------------------
+        // 5. Check cellular operator
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println();
+        Serial.println("Checking cellular operator...");
+
+        sim800.println("AT+COPS?");
+
+        start = millis();
+
+        String copsResponse = "";
+
+        while (millis() - start < 5000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                copsResponse += c;
+            }
+
+            if (copsResponse.indexOf("+COPS:") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete COPS Response:");
+        Serial.println(copsResponse);
+
+
+        // --------------------------------------------------------
+        // 6. Set SMS text mode
+        // --------------------------------------------------------
+
+        while (sim800.available()) {
+            sim800.read();
+        }
+
+        Serial.println();
+        Serial.println("Setting SMS text mode...");
+
+        sim800.println("AT+CMGF=1");
+
+        start = millis();
+
+        String cmgfResponse = "";
+
+        while (millis() - start < 3000) {
+
+            while (sim800.available()) {
+
+                char c = sim800.read();
+
+                Serial.write(c);
+                cmgfResponse += c;
+            }
+
+            if (cmgfResponse.indexOf("OK") != -1 ||
+                cmgfResponse.indexOf("ERROR") != -1) {
+                break;
+            }
+        }
+
+        Serial.println();
+        Serial.println("Complete CMGF Response:");
+        Serial.println(cmgfResponse);
+
+
+        if (cmgfResponse.indexOf("OK") != -1) {
+
+            Serial.println(
+                "SMS text mode: READY"
+            );
+
+        } else {
+
+            Serial.println(
+                "WARNING: SMS text mode could not be enabled."
+            );
+        }
+
+
+        Serial.println();
+        Serial.println("--- SIM800L DEBUG END ---");
+        Serial.println();
+
+    } else {
+
+        // ========================================================
+        // SIM800 DISABLED
+        // ========================================================
+
+        Serial.println();
+        Serial.println("======================================");
+        Serial.println("       SIM800 DISABLED");
+        Serial.println("======================================");
+
+        Serial.println(
+            "SIM800 initialization skipped."
+        );
+
+        Serial.println(
+            "SIM800 power/TX/RX can remain disconnected."
+        );
+
+        Serial.println(
+            "SMS functionality will be skipped."
+        );
+
+        Serial.println(
+            "======================================");
+        Serial.println();
+
+    }
+
+
+    // ============================================================
+    // TFT INITIALIZATION
+    // ============================================================
+
+    Serial.println("Initializing TFT...");
+
+    tft.init();
+
+    tft.setRotation(1);
+
+    tft.invertDisplay(true);
+
+    tft.setTouch(calData);
+
+    Serial.println("TFT initialization completed.");
+
+
+    // ============================================================
+    // WIFI
+    // ============================================================
+
+    Serial.println();
+    Serial.println("Connecting WiFi...");
+
+    connectWiFi();
+
+
+    // ============================================================
+    // SALESFORCE
+    // ============================================================
+
+    Serial.println();
+    Serial.println("Attempting Salesforce authentication...");
+
+    if (sfLogin()) {
+
+        Serial.println(
+            "Salesforce is ready for Platform Events."
+        );
+
+    } else {
+
+        Serial.println(
+            "WARNING: Kiosk running without direct "
+            "Salesforce API access."
+        );
+    }
+
+
+    // ============================================================
+    // MQTT
+    // ============================================================
+
+    client.setServer(mqtt_server, 1883);
+
+    client.setCallback(callback);
+
+
+    // ============================================================
+    // INITIAL TFT SCREEN
+    // ============================================================
+
+    drawMainPage();
+
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("       KIOSK SYSTEM ONLINE");
+    Serial.println("======================================");
+
+    delay(5000);
+}
+
+// ---------------------------- LOOP ----------------------------------------
+
+void loop() {
+    handleTouch();    
+
+    if (!client.connected()) {
+        unsigned long now = millis();
+        if (now - lastMqttRetry > 10000) {
+            Serial.println("MQTT Connection Lost. Retrying...");
+            lastMqttRetry = now;
+            reconnectMQTT(); 
+        }
+    } else {
+        client.loop();
+    }
+
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat > 30000) {
+        Serial.println("...Loop Active (Waiting for Serial Scan/MQTT/Touch)...");
+        lastHeartbeat = millis();
+    }
+
+    if (Serial.available() > 0) {
+        String incomingString = Serial.readStringUntil('\n');
+        incomingString.trim();
+
+        if (incomingString.length() > 0) {
+            if (incomingString == "s" || incomingString == "S") {
+                simulateHelpRequest();
+            } 
+            else if (incomingString.startsWith("{")) {
+                Serial.println("\n--- RECEIVED DYNAMIC JSON OVER SERIAL ---");
+                
+                JsonDocument doc; 
+                DeserializationError error = deserializeJson(doc, incomingString);
+
+                if (error) {
+                    Serial.print("JSON Parsing Failed: ");
+                    Serial.println(error.c_str());
+                } else {
+                    uiFirstName       = doc["firstName"] | "Unknown";
+                    uiLastName        = doc["lastName"] | "User";
+                    lastScannedMobile = doc["mobile"] | "0000000000";
+                    uicrewHelp        = doc["crewHelp"] | false;
+                    uiEmail           = doc["email"] | "no-email@example.com";
+                    uiEventRegNum     = doc["regNum"] | "SF000000XX";
+                    uiStatus          = doc["status"] | "Pending";
+                    uiHasAttended     = doc["hasAttended"] | false;
+                    uiUIN             = doc["uin"] | "SFUNKNOWN0000";
+
+                    executeKioskFlow();
+                }
+            }
+        }
+    }
+
+    if (currentPage == PAGE_MAIN && !displayingData) {
+        if (millis() - lastBlinkTime > 500) {
+            lastBlinkTime = millis();
+            blinkState = !blinkState;
+            drawIdleBlink();
+        }
+    }
+    
+    // -------------------- 45 SECOND INACTIVITY TIMEOUT --------------------
+    // Every interactive screen gets its own 45-second inactivity window.
+    // A valid touch resets lastInteractionTime (see handleTouch()).
+    // The standby/Waiting-for-QR screen intentionally remains on-screen forever.
+    if ((displayingData || currentPage != PAGE_MAIN) &&
+        (millis() - lastInteractionTime >= dataDisplayDuration)) {
+
+        Serial.println("45s Inactivity Timeout! Returning to Standby layout...");
+        resetToStandby();
+    }
+
+    pollThingSpeak(); 
+}
+
+// ---------------------------- TOUCH LOGIC --------------------------------
+
+void showFeedback(String msg, uint16_t color) {
+    tft.fillRoundRect(20, 60, 280, 135, 10, 0x1082); 
+    tft.drawRoundRect(20, 60, 280, 135, 10, color);
+    
+    tft.setTextColor(color);
+    tft.setTextSize(2);
+
+    if (msg.indexOf("Salesforce") != -1) {
+        tft.setTextColor(WHITE);
+        tft.setTextSize(2);
+        tft.drawCentreString("Your Response Sent", 160, 75, 1);
+        
+        int labelY = 105; 
+        
+        tft.setTextColor(CYAN); 
+        tft.drawCentreString("To Agentforce", 160, labelY, 1);
+        tft.drawCentreString("To Agentforce", 161, labelY, 1);
+        tft.drawCentreString("To Agentforce", 160, labelY + 1, 1);
+    } 
+    else if (msg.indexOf("Crew") != -1 || msg.indexOf("Notified") != -1) {
+        tft.setTextSize(2);
+        tft.setTextColor(WHITE);
+        tft.drawCentreString("Slack Message Sent!", 160, 78, 1);
+        
+        tft.setTextColor(CYAN);
+        tft.drawCentreString("Via Agentforce...", 160, 108, 1);
+    } 
+    else {
+        tft.drawCentreString(msg, 160, 95, 1);
+    }
+
+    tft.fillRoundRect(110, 145, 100, 35, 5, BLUE);
+    tft.setTextColor(WHITE);
+    tft.drawCentreString("BACK", 160, 155, 1);
+}
+
+
+void handleTouch() {
+    uint16_t x = 0, y = 0;
+    if (tft.getTouch(&x, &y)) {
+
+        lastInteractionTime = millis();
+
+        // --- PAGE: MAIN (Home Screen) ---
+        if (currentPage == PAGE_MAIN) {
+            if (y > BTN_Y && y < 240) { 
+                
+                // 1. SESSIONS BUTTON
+                if (x > BTN_LEFT_X && x < (BTN_LEFT_X + BTN_W)) {
+                    Serial.println("SESSIONS CLICKED - Commanding Voice ESP");
+                    client.publish("Jasakash/robot02/voice/control", "SESSION_VOICE");
+                    
+                    flashButton(BTN_LEFT_X, BTN_Y, BTN_W, BTN_H, CYAN, "Sessions", BLUE);
+                    
+                    currentPage = PAGE_SESSIONS;
+                    
+                    tft.fillScreen(BLACK);
+                    tft.setTextColor(CYAN);
+                    tft.drawCentreString("Fetching Sessions...", 160, 100, 1);
+                    delay(100); 
+                    
+                    drawSessionsPage();
+                    drawSessionsList();
+                    resetScreenTimeout();
+                }
+                
+                // 2. HELP YES BUTTON (Replaced Selfie Button Logic)
+                else if (x > BTN_RIGHT_X && x < (BTN_RIGHT_X + BTN_W)) {
+                    Serial.println("HELP YES CLICKED - Sending Slack Alert...");    
+                    
+                    uicrewHelp = true; // Update internal flag to help request active
+                    
+                    // Trigger Slack Notification on Demand
+                    sendSlackAlert(uiName, uiMobile, uiStatus);
+                    
+                    flashButton(BTN_RIGHT_X, BTN_Y, BTN_W, BTN_H, CYAN, "Help YES", BLUE);
+                    currentPage = PAGE_FEEDBACK; 
+                    showFeedback("Crew Notified via Slack!", GREEN);
+                    resetScreenTimeout();
+                }
+            }
+        } 
+        
+        // --- PAGE: SESSIONS ---
+        else if (currentPage == PAGE_SESSIONS) {
+            if (tsSessions.indexOf("no requested sessions") != -1 || tsSessions.indexOf("confirmed") != -1) {
+                if (x > 100 && x < 220 && y > 170) {
+                    flashButton(100, 185, 120, 40, WHITE, "BACK", RED);
+                    drawMainPage();
+                    resetScreenTimeout();
+                }
+            } 
+            else if (y > 170) {  
+                if (x > 20 && x < 150) {
+                    flashButton(20, 185, 130, 40, WHITE, "YES", GREEN);
+                    sendConsentToSalesforce(true);
+                    currentPage = PAGE_FEEDBACK; 
+                    showFeedback("Response Sent To Salesforce", GREEN);
+                    resetScreenTimeout();
+                }
+                else if (x > 170 && x < 300) { 
+                    flashButton(170, 185, 130, 40, CYAN, "NO", RED);
+                    drawMainPage();
+                    resetScreenTimeout();
+                }
+            }
+        }
+
+        // --- PAGE: FEEDBACK ---
+        else if (currentPage == PAGE_FEEDBACK) {
+            if (x > 100 && x < 220 && y > 130 && y < 190) { 
+                Serial.println("BACK/OK Clicked - Animating...");
+                
+                client.publish("Jasakash/robot01/motion/control", "MODE_DEFAULT");   
+                                             
+                flashButton(110, 145, 100, 35, WHITE, "BACK", BLUE);
+                
+                drawMainPage(); 
+                resetScreenTimeout();
+                delay(300);
+            }
+        }
+    }
+}
+
+// -------------------------------fetch Sessions To Memory------------------------------------
+
+void fetchSessionsToMemory() {
+    HTTPClient http;
+    String url = "https://api.thingspeak.com/channels/" + String(tsChannelId) + "/feeds/last.json?api_key=" + String(tsReadApiKey);
+    
+    Serial.println("--> [CACHE SYSTEM] Proactively fetching sessions from ThingSpeak...");
+    if (http.begin(url)) {
+        int code = http.GET();
+        if (code == 200) {
+            StaticJsonDocument<1024> doc; 
+            deserializeJson(doc, http.getString());
+            
+            tsSessions = doc["field1"] | ""; 
+            tsAttendeeId = doc["field2"] | "";
+            
+            Serial.println("--> [CACHE SYSTEM] Data successfully stored in background memory:");
+            Serial.println(tsSessions);
+            
+            if (currentPage == PAGE_SESSIONS) {
+                drawSessionsPage(); 
+            }
+        } else {
+            Serial.printf("--> [CACHE SYSTEM] Fetch failed. HTTP Error: %d\n", code);
+        }
+        http.end();
+    } else {
+        Serial.println("--> [CACHE SYSTEM] Connection setup failed.");
+    }
+} 
+
+//----------------------- Draw Sessions Page with conditional rendering of status ---------------------------
+
+void drawSessionsPage() {
+    currentPage = PAGE_SESSIONS;
+    tft.fillScreen(TFT_BLACK);
+    
+    tft.fillRect(0, 0, 320, 40, TFT_BLUE);
+    tft.setTextColor(CYAN);
+    tft.setTextSize(2);
+    tft.drawCentreString("Your Requested Sessions:", 160, 10, 1);
+
+    if (tsSessions.indexOf("confirmed") != -1) {
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        tft.setCursor(15, 55);
+        tft.println("Confirmed Sessions:");
+
+        int matchIdx = tsSessions.indexOf("confirmed:");
+        String listPart = "";
+        if (matchIdx != -1) {
+            listPart = tsSessions.substring(matchIdx + 10);
+        } else {
+            int altMatch = tsSessions.indexOf("confirmed");
+            if (altMatch != -1) listPart = tsSessions.substring(altMatch + 9);
+        }
+        listPart.trim();
+
+        int itemNum = 1;
+        int startIdx = 0;
+        int commaIdx = listPart.indexOf(',');
+        int yPos = 85;
+
+        while (commaIdx != -1) {
+            String sessionItem = listPart.substring(startIdx, commaIdx);
+            sessionItem.trim();
+            if (sessionItem.length() > 0) {
+                tft.setCursor(15, yPos);
+                tft.print(String(itemNum) + ") " + sessionItem);
+                itemNum++;
+                yPos += 25;
+            }
+            startIdx = commaIdx + 1;
+            commaIdx = listPart.indexOf(',', startIdx);
+        }
+
+        String lastItem = listPart.substring(startIdx);
+        lastItem.replace(".", "");
+        lastItem.trim();
+        if (lastItem.length() > 0) {
+            tft.setCursor(15, yPos);
+            tft.print(String(itemNum) + ") " + lastItem);
+        }
+
+        tft.fillRoundRect(100, 185, 120, 40, 5, TFT_RED);
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        tft.drawCentreString("BACK", 160, 197, 1);
+
+    } else {
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        
+        int y = 60;
+        if (tsSessions.length() > 0) {
+            tft.setCursor(15, 60);
+            tft.println(tsSessions); 
+        } else {
+            for (int i = 0; i < sessionCount; i++) {
+                tft.setCursor(20, y);
+                tft.print(i + 1); tft.print(". "); tft.println(sessions[i]);
+                y += 25;
+            }
+        }
+
+        tft.setTextColor(TFT_RED);
+        tft.drawCentreString("Please Give Your Consent:", 160, 150, 1);
+
+        tft.fillRoundRect(20, 185, 130, 40, 5, TFT_GREEN);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawCentreString("YES", 85, 197, 1);
+        
+        tft.fillRoundRect(170, 185, 130, 40, 5, TFT_RED);
+        tft.drawCentreString("NO", 235, 197, 1);
+    }
+}
+
+//----------------------- Dynamic Execution Flow --------------------------
+
+void executeKioskFlow() {
+    displayingData = true;
+    resetScreenTimeout();
+    Serial.println("\n--- PROCESSING KIOSK FLOW ---");
+
+    uiName = uiFirstName + " " + uiLastName; 
+
+    if (lastScannedMobile.length() >= 4) {
+        uiMobile = "xxxxxx" + lastScannedMobile.substring(lastScannedMobile.length() - 4);
+    } else {
+        uiMobile = lastScannedMobile;
+    }
+
+    if (client.connected()) {
+        String voicePayload = "{\"firstName\":\"" + uiFirstName + "\", \"status\":\"" + uiStatus + "\"}";
+        client.publish("event/attendee", voicePayload.c_str());
+
+        if (uiStatus == "Confirmed") {
+            client.publish("Jasakash/robot01/motion/control", "TALK_START");
+        }
+
+        String pePayload = "{";
+        pePayload += "\"FirstName\":\"" + uiFirstName + "\",";
+        pePayload += "\"LastName\":\"" + uiLastName + "\",";
+        pePayload += "\"MobileNumber\":\"" + lastScannedMobile + "\",";
+        pePayload += "\"CrewHelp\":" + String(uicrewHelp ? "true" : "false") + ",";
+        pePayload += "\"Email\":\"" + uiEmail + "\",";
+        pePayload += "\"EventRegistrationNumber\":\"" + uiEventRegNum + "\",";
+        pePayload += "\"Status\":\"" + uiStatus + "\",";
+        pePayload += "\"HasAttended\":" + String(uiHasAttended ? "true" : "false") + ",";
+        pePayload += "\"UIN\":\"" + uiUIN + "\"";
+        pePayload += "}";
+
+        client.publish("event/platform_event", pePayload.c_str());
+    }
+ 
+    delay(500); 
+    client.loop(); 
+
+    QRFields dataPacket;
+    dataPacket.firstName          = uiFirstName;
+    dataPacket.lastName           = uiLastName;
+    dataPacket.mobileNumber       = lastScannedMobile; 
+    dataPacket.email              = uiEmail;
+    dataPacket.registrationNumber = uiEventRegNum;
+    dataPacket.uniqueId           = uiUIN;
+    dataPacket.status             = uiStatus;
+    dataPacket.helpcrew           = uicrewHelp ? "true" : "false";
+    dataPacket.hasAttended        = uiHasAttended;
+
+    sendPlatformEvent(dataPacket);
+
+    drawMainPage(); 
+
+    fetchSessionsToMemory();
+    lastTsCheck = millis(); 
+
+    Serial.println("--- PROCESSING COMPLETE ---\n");
+}
+
+void simulateHelpRequest() {
+    Serial.println("Loading default simulation data...");
+    uiFirstName = "Jasjit";
+    uiLastName = "Singh";
+    lastScannedMobile = "9971505511";
+    uicrewHelp = true; 
+    uiEmail = "jasvicky@gmail.com";
+    uiEventRegNum = "SF997150JS";
+    uiStatus = "Confirmed";
+    uiHasAttended = true;
+    uiUIN = "SFJASJIT9971505511";
+
+    executeKioskFlow();
+}
+
+// ------------------------------ THINK SPEAK  ---------------------------------
+
+void pollThingSpeak() {
+    if (millis() - lastTsCheck < 15000) return;
+    lastTsCheck = millis();
+    
+    fetchSessionsToMemory();
+
+    if (tsSessions.indexOf("confirmed") != -1) {
+        if (!seatConfirmedAnnounced) {
+            client.publish("Jasakash/robot02/voice/control", "SEAT_CONFIRMED");
+            seatConfirmedAnnounced = true;
+        }
+    } else {
+        seatConfirmedAnnounced = false; 
+    }
+}
+
+// ------------------------------------- WiFi -------------------------------------
+
+void connectWiFi() {
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting WiFi");
+  
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+  
+    Serial.println("\nWiFi connected");
+    Serial.println(WiFi.localIP());
+}
+
+// -------------------------------- MQTT -----------------------------
+
+void reconnectMQTT() {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32_Robot_Kiosk")) {
+        Serial.println("connected");
+        client.subscribe(mqtt_topic);
+    } else {
+        Serial.print("failed, rc=");
+        Serial.println(client.state());
+    }
+}
+
+// ---------------- Salesforce OAuth ----------
+
+bool sfLogin() {
+    Serial.println("\n=============================================");
+    Serial.println("--> [SF LOGIN] Starting Salesforce Login Process...");
+    Serial.println("=============================================");
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("--> [SF LOGIN] ERROR: WiFi is not connected! Cannot log in.");
+        return false;
+    }
+
+    WiFiClientSecure ssl;
+    ssl.setInsecure();
+  
+    HTTPClient http;
+    String loginUrl = "https://login.salesforce.com/services/oauth2/token";
+    
+    if (!http.begin(ssl, loginUrl)) {
+        Serial.println("--> [SF LOGIN] FATAL: http.begin() failed. Check URL or memory.");
+        return false;
+    }
+  
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+    String body = "grant_type=password";     
+    body += "&client_id="     + String(sfClientId);
+    body += "&client_secret=" + String(sfClientSecret);
+    body += "&username="      + String(sfUsername);
+    body += "&password="      + String(sfPasswordTok);
+  
+    int httpCode = http.POST(body);
+    String responsePayload = http.getString();
+    http.end();
+  
+    Serial.printf("--> [SF LOGIN] HTTP Status Code Received: %d\n", httpCode);
+  
+    if (httpCode <= 0) {
+        Serial.println("--> [SF LOGIN] Network Error: " + http.errorToString(httpCode));
+        return false;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, responsePayload);
+    if (err) {
+        Serial.print("--> [SF LOGIN] JSON Parsing Failed: ");
+        Serial.println(err.c_str());
+        return false;
+    }
+  
+    if (httpCode == 200 && doc.containsKey("access_token")) {
+        sfAccessToken = doc["access_token"].as<String>();
+        sfInstanceUrl = doc["instance_url"].as<String>();
+        
+        Serial.println("--> [SF LOGIN] SUCCESS! Connected Successfully.");
+        return true;
+    } 
+    else {
+        Serial.println("--> [SF LOGIN] FAILED: Credentials or Connected App configuration rejected.");
+        return false;
+    }
+}
+
+//---------------------- build Personalized SMS----------------
+
+String buildPersonalizedSMS(const String& firstName, const String& status) {
+
+    String msg;
+    if (status.equalsIgnoreCase("Confirmed")) {
+        msg = "Hello " + firstName + " !\n";
+        msg += "Your Registration to the Salesforce Event is completed Now.\n";
+        msg += "Your Registration Status is :- " + status + " !\n" ;
+        msg += "You may proceed to Gate number One.\n";
+        msg += "Have a Good Day";
+    } else {
+        msg = "Hello " + firstName + " !\n";
+        msg += "Your Registration to the Salesforce Event is not completed yet. As your Registration Status is: " + status + "\n";
+        msg += "Please Contact Help Desk.";
+    }
+    return msg;
+}
+
+ // ---------------- Salesforce Consent ----------------------
+
+bool sendConsentToSalesforce(bool yes) {
+    if (tsAttendeeId.length() == 0) {
+      Serial.println("No tsAttendeeId set from ThingSpeak – cannot send consent.");
+      return false;
+    }
+  
+    if (sfAccessToken == "" || sfInstanceUrl == "") {
+      if (!sfLogin()) {
+        Serial.println("Salesforce login failed.");
+        return false;
+      }
+    }
+  
+    WiFiClientSecure ssl;
+    ssl.setInsecure();
+    HTTPClient http;
+  
+    String url = sfInstanceUrl + "/services/apexrest/eventSessions";
+  
+    if (!http.begin(ssl, url)) {
+      Serial.println("SF consent begin() failed");
+      return false;
+    }
+  
+    http.addHeader("Authorization", "Bearer " + sfAccessToken);
+    http.addHeader("Content-Type", "application/json");
+  
+    String consent = yes ? "YES" : "NO";
+  
+    String body = "{";
+    body += "\"attendeeId\":\"" + tsAttendeeId + "\",";
+    body += "\"consent\":\""    + consent      + "\",";
+    body += "\"robotId\":\"Robot01\"";
+    body += "}";
+  
+    int code = http.POST(body);
+    String resp = http.getString();
+    http.end();
+  
+    Serial.printf("SF consent POST code: %d\n", code);
+    return (code >= 200 && code < 300);
+}
+
+ // ---------------- showCrewResponse on TFT ----------------------
+
+void showCrewResponse(String attendee, String crew) {
+    currentPage = PAGE_FEEDBACK; 
+
+    tft.fillRoundRect(10, 40, 300, 185, 10, RED); 
+    tft.drawRoundRect(10, 40, 300, 185, 10, GREEN);
+    
+    int leftMargin = 25;
+    int y = 55;
+
+    tft.setTextSize(2);
+    tft.setCursor(leftMargin, y);
+    tft.setTextColor(WHITE);
+    tft.print("Hi "); 
+    tft.setTextColor(GREEN); 
+    tft.println(attendee + ",");
+    
+    y += 25;
+    tft.setCursor(leftMargin, y);
+    tft.setTextColor(WHITE);
+    tft.println("Crew help person:-");
+
+    y += 25;
+    tft.setCursor(leftMargin, y);
+    tft.setTextColor(YELLOW); 
+    tft.println(crew);
+
+    y += 25; 
+    tft.setCursor(leftMargin, y);
+    tft.setTextColor(WHITE);
+    tft.println("is on the way for Help!");
+    
+    y += 25; 
+    tft.setCursor(leftMargin, y);
+    tft.setTextSize(2);
+    tft.println("More detials are send");
+    y += 25; tft.setCursor(leftMargin, y);
+    tft.println("by SMS.");
+
+    int btnX = 110; 
+    int btnY = 185;
+    
+    tft.fillRoundRect(btnX, btnY, 100, 35, 5, GREEN);
+    tft.setTextColor(BLACK);
+    tft.setTextSize(2);
+    tft.drawCentreString("OK", btnX + 50, btnY + 10, 1);
+    resetScreenTimeout();
+}
+
+ //---------------- Send Crew Response on 2nd SMS ----------------------
+
+String buildCrewArrivalSMS(const String& firstName, const String& crewName, const String& crewPhone) {
+    String msg = "Hi " + firstName + "!\n";
+    msg += "Good news! Crew member '" + crewName + "' has acknowledged your request.\n";
+    
+    if (crewPhone.length() > 0) {
+        msg += "You can reach him at " + crewPhone + ".\n";
+    }
+    
+    msg += "He is on the way to your location now.\n";
+    msg += "Thank you for your patience!";
+    return msg;
+}
+
+ //---------------- Flash look on TFT buttons ----------------------
+
+void flashButton(int x, int y, int w, int h, uint16_t highlightColor, String label, uint16_t originalColor) {
+    tft.fillRoundRect(x, y, w, h, 5, highlightColor);
+    tft.drawRoundRect(x, y, w, h, 5, WHITE);
+    tft.setTextColor(WHITE);
+    tft.drawCentreString(label, x + (w/2), y + (h/2) - 7, 1);
+    
+    delay(100);
+    
+    tft.fillRoundRect(x, y, w, h, 5, originalColor);
+    tft.drawCentreString(label, x + (w/2), y + (h/2) - 7, 1);
+}
+ 
+void drawIdleBlink() {
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H + FOOTER_H, TFT_MAGENTA); 
+    
+    if (blinkState) {
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(3);
+        tft.drawCentreString("Waiting", 160, 110, 1);
+        tft.drawCentreString("for QR Scan...", 160, 150, 1);
+    }
+}  
+
+ // -------------------------- Send Platform Event -------------------
+ 
+void sendPlatformEvent(const QRFields& fields) {
+    Serial.println("--> [DEBUG] Inside sendPlatformEvent");
+
+    if (sfAccessToken == "" || sfInstanceUrl == "") {
+        if (!sfLogin()) {
+            Serial.println("--> [DEBUG] SF Login failed! Aborting.");
+            return;
+        }
+    }
+
+    WiFiClientSecure sslClient;
+    sslClient.setInsecure();
+  
+    HTTPClient http;
+    String url = sfInstanceUrl + SF_EVENT_URL;
+
+    if (http.begin(sslClient, url)) { 
+        http.addHeader("Authorization", "Bearer " + sfAccessToken);
+        http.addHeader("Content-Type", "application/json");
+
+        StaticJsonDocument<512> doc;
+        doc["First_Name__c"] = fields.firstName;
+        doc["Last_Name__c"] = fields.lastName;
+        doc["Email__c"] = fields.email;
+        
+        if (fields.mobileNumber.length() > 0) {
+            doc["Mobile_Number__c"] = atoll(fields.mobileNumber.c_str());
+        } else {
+            doc["Mobile_Number__c"] = 0;
+        }
+        
+        doc["Event_Registration_Number__c"] = fields.registrationNumber;
+        doc["Unique_Identity_Number__c"] = fields.uniqueId;
+        doc["Status__c"] = fields.status;
+        doc["Ground_Help_Crew_Required__c"] = (fields.helpcrew == "true" || fields.helpcrew == "1");
+        doc["Has_Attended__c"] = fields.hasAttended;  
+         
+        String body;
+        serializeJson(doc, body);
+
+        int httpCode = http.POST(body);
+        String response = http.getString();
+
+        if (httpCode == 201) {
+            Serial.println("--> [DEBUG] Platform Event sent successfully!");
+        } 
+        else if (httpCode == 401) { 
+            sfAccessToken = "";
+            http.end();
+            
+            if (sfLogin()) {
+                sendPlatformEvent(fields);
+                return; 
+            }
+        } 
+        else {
+            Serial.println("--> [DEBUG] Failed to send platform event. Response: " + response);
+        }
+
+        http.end();
+    } else {
+        Serial.println("--> [DEBUG] FATAL: http.begin() failed!");
+    }
+}
